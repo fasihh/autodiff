@@ -13,20 +13,42 @@ class Node:
     _backward: Callable = lambda: None
 
     def zero_grad(self):
-        self.grad = np.zeros_like(self.grad)
+        self.grad = np.zeros_like(self.grad, dtype=np.float64)
 
     def __post_init__(self):
         if np.isscalar(self.value):
             self.value = np.array([[self.value]], dtype=np.float64)
+        else:
+            self.value = np.asarray(self.value, dtype=np.float64)
         if self.grad is None:
-            self.grad = np.zeros_like(self.value)
+            self.grad = np.zeros_like(self.value, dtype=np.float64)
 
     @staticmethod
     def __ensure_node(obj: Value) -> "Node":
         if isinstance(obj, Node):
             return obj
-        val = np.array([[obj]]) if np.isscalar(obj) else np.array(obj)
+        val = np.array([[obj]], dtype=np.float64) if np.isscalar(obj) else np.array(obj, dtype=np.float64)
         return Node(str(obj), val)
+
+    @staticmethod
+    def __sum_to_shape(grad: np.ndarray, shape: tuple) -> np.ndarray:
+        """Reduce a broadcasted gradient back to the original operand shape."""
+        while grad.ndim > len(shape):
+            grad = grad.sum(axis=0)
+
+        for axis, size in enumerate(shape):
+            if size == 1 and grad.shape[axis] != 1:
+                grad = grad.sum(axis=axis, keepdims=True)
+
+        return grad
+    
+    @staticmethod
+    def ones(shape: tuple) -> "Node":
+        return Node("ones", np.ones(shape))
+    
+    @staticmethod
+    def randn(shape: tuple, scale: float = 1.0) -> "Node":
+        return Node("randn", np.random.randn(*shape) * scale)
 
     @staticmethod
     def relu(obj: Value) -> "Node":
@@ -87,14 +109,15 @@ class Node:
         return out
     
     @staticmethod
-    def mse(values: "Node", target_values: np.ndarray) -> "Node":
+    def mse(values: "Node", target: Value) -> "Node":
+        target = Node.__ensure_node(target)
         batch_size = values.value.shape[0]
-        loss_value = np.mean((values.value[np.arange(batch_size)] - target_values) ** 2) / 2
+        loss_value = np.mean((values.value[np.arange(batch_size)] - target.value) ** 2) / 2
 
         out = Node(f"mse({values.label})", np.array([[loss_value]]), children=[values])
 
         def _backward():
-            grad = values.value[np.arange(batch_size)] - target_values
+            grad = values.value[np.arange(batch_size)] - target.value
             values.grad += out.grad * grad
 
         out._backward = _backward
@@ -132,14 +155,33 @@ class Node:
         out._backward = _backward
         return out
 
+    def sum(self) -> "Node":
+        value = np.sum(self.value)
+        out = Node(f"sum({self.label})", value=value, children=[self])
+
+        def _backward():
+            self.grad += out.grad * np.ones_like(self.value)
+        
+        out._backward = _backward
+        return out
+    
+    def abs(self) -> "Node":
+        value = np.abs(self.value)
+        out = Node(f"abs({self.label})", value=value, children=[self])
+
+        def _backward():
+            self.grad += out.grad * np.sign(self.value)
+
+        out._backward = _backward
+        return out
+
     def __add__(self, obj: Value) -> "Node":
         obj = Node.__ensure_node(obj)
         out = Node(f"({self.label}+{obj.label})", self.value + obj.value, children=[self,obj])
 
         def _backward():
-            print(self.label, obj.label, out.label, sep="\n")
-            self.grad += out.grad
-            obj.grad += out.grad
+            self.grad += Node.__sum_to_shape(out.grad, self.value.shape)
+            obj.grad += Node.__sum_to_shape(out.grad, obj.value.shape)
 
         out._backward = _backward
         return out
@@ -149,8 +191,8 @@ class Node:
         out = Node(f"({self.label}*{obj.label})", self.value * obj.value, children=[self,obj])
 
         def _backward():
-            self.grad += out.grad * obj.value
-            obj.grad += out.grad * self.value
+            self.grad += Node.__sum_to_shape(out.grad * obj.value, self.value.shape)
+            obj.grad += Node.__sum_to_shape(out.grad * self.value, obj.value.shape)
 
         out._backward = _backward
         return out
@@ -179,6 +221,13 @@ class Node:
     def __hash__(self):
         return id(self)
 
+    def __len__(self):
+        return len(self.value)
+
+    @property
+    def shape(self):
+        return self.value.shape
+
     def backward(self):
         topo = []
         visited = set()
@@ -190,6 +239,6 @@ class Node:
                 build(child)
             topo.append(node)
         build(self)
-        self.grad = np.ones_like(self.value)
+        self.grad = np.ones_like(self.value, dtype=np.float64)
         for node in reversed(topo):
             node._backward()
