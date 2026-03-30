@@ -1,34 +1,70 @@
-from dataclasses import dataclass, field
-from typing import List, Callable, Union
+from typing import List, Union, Literal
 import numpy as np
 
-Value = Union["Node", float, np.ndarray]
+type Value = Union["Node", float, np.ndarray]
+type Device = Literal["cpu", "gpu"]
 
-@dataclass
+def xp(device: Device):
+    if device == "cpu":
+        import numpy as np
+        return np
+    try:
+        import cupy as cp # type: ignore
+        return cp
+    except ImportError:
+        raise RuntimeError("cuda environment missing")
+
 class Node:
-    label: str
-    value: np.ndarray
-    grad: np.ndarray = None
-    children: List["Node"] = field(default_factory=list)
-    _backward: Callable = lambda: None
+    def __init__(
+        self,
+        label: str, value: np.ndarray,
+        grad: np.ndarray = None,
+        children: List["Node"] = [],
+        device: Device = "cpu"
+    ):
+        self.label = label
+        self.value = value
+        self.grad = grad
+        self.children = children
+        self.device = device
+        self._backward = lambda: None
+
+        if xp(device).isscalar(self.value):
+            self.value = xp(device).array([[self.value]], dtype=xp(device).float64)
+        else:
+            self.value = xp(device).asarray(self.value, dtype=xp(device).float64)
+        if self.grad is None:
+            self.grad = xp(device).zeros_like(self.value, dtype=xp(device).float64)
+
+    def __convert_to_device(self, device: Device):
+        self.device = device
+
+        self.value = xp(device).asarray(self.value)
+        self.grad = xp(device).asarray(self.grad)
+        self.device = "gpu"
+
+        for child in self.children:
+            child.__convert_to_device(device)
+
+    def to_gpu(self):
+        self.__convert_to_device("gpu")
+        return self
+    
+    def to_cpu(self):
+        self.__convert_to_device("cpu")
+        return self
 
     def zero_grad(self):
-        self.grad = np.zeros_like(self.grad, dtype=np.float64)
-
-    def __post_init__(self):
-        if np.isscalar(self.value):
-            self.value = np.array([[self.value]], dtype=np.float64)
-        else:
-            self.value = np.asarray(self.value, dtype=np.float64)
-        if self.grad is None:
-            self.grad = np.zeros_like(self.value, dtype=np.float64)
+        self.grad = xp(self.device).zeros_like(self.grad, dtype=xp(self.device).float64)
 
     @staticmethod
-    def __ensure_node(obj: Value) -> "Node":
+    def __ensure_node(obj: Value, device: Device = "cpu") -> "Node":
         if isinstance(obj, Node):
+            if obj.device != device:
+                raise RuntimeError(f"mismatch in devices: {obj} not {device}")
             return obj
-        val = np.array([[obj]], dtype=np.float64) if np.isscalar(obj) else np.array(obj, dtype=np.float64)
-        return Node(str(obj), val)
+        val = xp(device).array([[obj]], dtype=xp(device).float64) if xp(device).isscalar(obj) else xp(device).array(obj, dtype=xp(device).float64)
+        return Node(str(obj), val, device=device)
 
     @staticmethod
     def __sum_to_shape(grad: np.ndarray, shape: tuple) -> np.ndarray:
@@ -43,18 +79,18 @@ class Node:
         return grad
     
     @staticmethod
-    def ones(shape: tuple) -> "Node":
-        return Node("ones", np.ones(shape))
+    def ones(shape: tuple, device: Device = "cpu") -> "Node":
+        return Node("ones", xp(device).ones(shape), device=device)
     
     @staticmethod
-    def randn(shape: tuple, scale: float = 1.0) -> "Node":
-        return Node("randn", np.random.randn(*shape) * scale)
+    def randn(shape: tuple, scale: float = 1.0, device: Device = "cpu") -> "Node":
+        return Node("randn", xp(device).random.randn(*shape) * scale, device=device)
 
     @staticmethod
-    def relu(obj: Value) -> "Node":
-        obj = Node.__ensure_node(obj)
-        value = np.maximum(0, obj.value)
-        out = Node(f"relu({obj.label})", value, children=[obj])
+    def relu(obj: Value, device: Device = "cpu") -> "Node":
+        obj = Node.__ensure_node(obj, device)
+        value = xp(device).maximum(0, obj.value)
+        out = Node(f"relu({obj.label})", value, children=[obj], device=device)
 
         def _backward():
             obj.grad += out.grad * (obj.value > 0)
@@ -63,10 +99,10 @@ class Node:
         return out
 
     @staticmethod
-    def sigmoid(obj: Value) -> "Node":
-        obj = Node.__ensure_node(obj)
-        value = 1 / (1 + np.exp(-obj.value))
-        out = Node(f"sigmoid({obj.label})", value, children=[obj])
+    def sigmoid(obj: Value, device: Device = "cpu") -> "Node":
+        obj = Node.__ensure_node(obj, device)
+        value = 1 / (1 + xp(device).exp(-obj.value))
+        out = Node(f"sigmoid({obj.label})", value, children=[obj], device=device)
 
         def _backward():
             obj.grad += out.grad * value * (1 - value)
@@ -75,59 +111,61 @@ class Node:
         return out
 
     @staticmethod
-    def softmax(obj: Value) -> "Node":
-        obj = Node.__ensure_node(obj)
-        shift = np.max(obj.value, keepdims=True, axis=1)
-        exps = np.exp(obj.value - shift)
-        probs = exps / np.sum(exps, keepdims=True, axis=1)
-        out = Node(f"softmax({obj.label})", probs, children=[obj])
+    def softmax(obj: Value, device: Device = "cpu") -> "Node":
+        obj = Node.__ensure_node(obj, device)
+        shift = xp(device).max(obj.value, keepdims=True, axis=1)
+        exps = xp(device).exp(obj.value - shift)
+        probs = exps / xp(device).sum(exps, keepdims=True, axis=1)
+        out = Node(f"softmax({obj.label})", probs, children=[obj], device=device)
 
         def _backward():
             # s = probs.reshape(-1,1)
             # jac = np.diagflat(probs) - np.dot(s, s.T)
             # obj.grad += jac @ out.grad.T
-            v_dot_p = np.sum(out.grad * probs, axis=1, keepdims=True)
+            v_dot_p = xp(device).sum(out.grad * probs, axis=1, keepdims=True)
             obj.grad += probs * (out.grad - v_dot_p)
         
         out._backward = _backward
         return out
 
     @staticmethod
-    def cross_entropy(probs: "Node", target_indices: np.ndarray) -> "Node":
+    def cross_entropy(probs: Value, target_indices: np.ndarray, device: Device = "cpu") -> "Node":
+        probs = Node.__ensure_node(probs, device)
         batch_size = probs.value.shape[0]
-        correct_confidences = probs.value[np.arange(batch_size), target_indices]
-        loss_value = -np.mean(np.log(correct_confidences))
+        correct_confidences = probs.value[xp(device).arange(batch_size), target_indices]
+        loss_value = -xp(device).mean(xp(device).log(correct_confidences))
 
-        out = Node(f"cross_entropy({probs.label})", np.array([[loss_value]]), children=[probs])
+        out = Node(f"cross_entropy({probs.label})", xp(device).array([[loss_value]]), children=[probs], device=device)
 
         def _backward():
-            grad = np.zeros_like(probs.value)
-            grad[np.arange(batch_size), target_indices] = -1.0 / (correct_confidences + 1e-15)
+            grad = xp(device).zeros_like(probs.value)
+            grad[xp(device).arange(batch_size), target_indices] = -1.0 / (correct_confidences + 1e-15)
             probs.grad += (grad * out.grad) / batch_size
 
         out._backward = _backward
         return out
     
     @staticmethod
-    def mse(values: "Node", target: Value) -> "Node":
-        target = Node.__ensure_node(target)
+    def mse(values: Value, target: Value, device: Device = "cpu") -> "Node":
+        values, target = Node.__ensure_node(values, device), Node.__ensure_node(target, device)
         batch_size = values.value.shape[0]
-        loss_value = np.mean((values.value[np.arange(batch_size)] - target.value) ** 2) / 2
+        loss_value = xp(device).mean((values.value[xp(device).arange(batch_size)] - target.value) ** 2) / 2
 
-        out = Node(f"mse({values.label})", np.array([[loss_value]]), children=[values])
+        out = Node(f"mse({values.label})", xp(device).array([[loss_value]]), children=[values], device=device)
 
         def _backward():
-            grad = values.value[np.arange(batch_size)] - target.value
+            grad = values.value[xp(device).arange(batch_size)] - target.value
             values.grad += out.grad * grad
 
         out._backward = _backward
         return out
 
     @staticmethod
-    def matmul(a: Value, b: Value) -> "Node":
-        a, b = Node.__ensure_node(a), Node.__ensure_node(b)
+    def matmul(a: Value, b: Value, device: Device = "cpu") -> "Node":
+        a = Node.__ensure_node(a, device)
+        b = Node.__ensure_node(b, device)
         value = a.value @ b.value
-        out = Node(f"matmul({a.label}, {b.label})", value, children=[a,b])
+        out = Node(f"matmul({a.label}, {b.label})", value, children=[a,b], device=device)
 
         def _backward():
             a.grad += out.grad @ b.value.T
@@ -137,10 +175,10 @@ class Node:
         return out
     
     @staticmethod
-    def concat(a: Value, b: Value, axis: int = 1) -> "Node":
-        a, b = Node.__ensure_node(a), Node.__ensure_node(b)
-        value = np.concatenate((a.value, b.value), axis=axis)
-        out = Node(f"concat({a.label}, {b.label})", value, children=[a, b])
+    def concat(a: Value, b: Value, axis: int = 1, device: Device = "cpu") -> "Node":
+        a, b = Node.__ensure_node(a, device), Node.__ensure_node(b, device)
+        value = xp(device).concatenate((a.value, b.value), axis=axis)
+        out = Node(f"concat({a.label}, {b.label})", value, children=[a, b], device=device)
 
         def _backward():
             split = a.value.shape[axis]
@@ -156,28 +194,28 @@ class Node:
         return out
 
     def sum(self) -> "Node":
-        value = np.sum(self.value)
-        out = Node(f"sum({self.label})", value=value, children=[self])
+        value = xp(self.device).sum(self.value)
+        out = Node(f"sum({self.label})", value=value, children=[self], device=self.device)
 
         def _backward():
-            self.grad += out.grad * np.ones_like(self.value)
+            self.grad += out.grad * xp(self.device).ones_like(self.value)
         
         out._backward = _backward
         return out
     
     def abs(self) -> "Node":
-        value = np.abs(self.value)
-        out = Node(f"abs({self.label})", value=value, children=[self])
+        value = xp(self.device).abs(self.value)
+        out = Node(f"abs({self.label})", value=value, children=[self], device=self.device)
 
         def _backward():
-            self.grad += out.grad * np.sign(self.value)
+            self.grad += out.grad * xp(self.device).sign(self.value)
 
         out._backward = _backward
         return out
 
     def __add__(self, obj: Value) -> "Node":
-        obj = Node.__ensure_node(obj)
-        out = Node(f"({self.label}+{obj.label})", self.value + obj.value, children=[self,obj])
+        obj = Node.__ensure_node(obj, self.device)
+        out = Node(f"({self.label}+{obj.label})", self.value + obj.value, children=[self,obj], device=self.device)
 
         def _backward():
             self.grad += Node.__sum_to_shape(out.grad, self.value.shape)
@@ -187,8 +225,8 @@ class Node:
         return out
 
     def __mul__(self, obj: Value) -> "Node":
-        obj = Node.__ensure_node(obj)
-        out = Node(f"({self.label}*{obj.label})", self.value * obj.value, children=[self,obj])
+        obj = Node.__ensure_node(obj, self.device)
+        out = Node(f"({self.label}*{obj.label})", self.value * obj.value, children=[self,obj], device=self.device)
 
         def _backward():
             self.grad += Node.__sum_to_shape(out.grad * obj.value, self.value.shape)
@@ -198,16 +236,16 @@ class Node:
         return out
 
     def __neg__(self) -> "Node":
-        return self * Node("-1", -1)
+        return self * Node("-1", -1, device=self.device)
 
     def __sub__(self, obj: Value) -> "Node":
-        return self + (-Node.__ensure_node(obj))
+        return self + (-Node.__ensure_node(obj, self.device))
     
     def __truediv__(self, obj: Value) -> "Node":
-        return self * (obj ** -1)
+        return self * (Node.__ensure_node(obj, self.device) ** -1)
     
     def __pow__(self, power: float) -> "Node":
-        out = Node(f"({self.label}^{power})", self.value ** power, children=[self])
+        out = Node(f"({self.label}^{power})", self.value ** power, children=[self], device=self.device)
 
         def _backward():
             self.grad += out.grad * power * (self.value ** (power - 1))
@@ -239,6 +277,6 @@ class Node:
                 build(child)
             topo.append(node)
         build(self)
-        self.grad = np.ones_like(self.value, dtype=np.float64)
+        self.grad = xp(self.device).ones_like(self.value, dtype=xp(self.device).float64)
         for node in reversed(topo):
             node._backward()

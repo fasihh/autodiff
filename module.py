@@ -1,21 +1,41 @@
 from typing import Dict, List
-from node import Node
+from node import Node, Device
+
 
 class Module:
-    def __init__(self):
+    def __init__(self, device: Device = "cpu"):
         self._parameters: Dict[str, Node] = {}
         self._modules: Dict[str, "Module"] = {}
         self._cached_params: List[Node] | None = None
+        self.device = device
 
     def parameters(self) -> List[Node]:
         if self._cached_params is not None:
             return self._cached_params
-        
+
         params = [p for p in self._parameters.values()]
         for m in self._modules.values():
             params.extend(m.parameters())
         self._cached_params = params
         return self._cached_params
+
+    def to_gpu(self):
+        self._cached_params = None
+        for param in self._parameters.values():
+            param.to_gpu()
+        for module in self._modules.values():
+            module.to_gpu()
+        self.device = "gpu"
+        return self
+
+    def to_cpu(self):
+        self._cached_params = None
+        for param in self._parameters.values():
+            param.to_cpu()
+        for module in self._modules.values():
+            module.to_cpu()
+        self.device = "cpu"
+        return self
 
     def __setattr__(self, name, value):
         if isinstance(value, Node):
@@ -38,14 +58,32 @@ class Module:
 
 
 class Linear(Module):
-    def __init__(self, in_dim: int, out_dim: int, label: str = ""):
-        super().__init__()
+    def __init__(
+        self, in_dim: int, out_dim: int, label: str = "", device: Device = "cpu"
+    ):
+        super().__init__(device)
 
-        self.W = Node.randn((in_dim, out_dim), 0.1)
+        self.W = Node.randn((in_dim, out_dim), 0.1, self.device)
         self.W.label = f"{label}.W" if label else "W"
 
-        self.b = Node.randn((1, out_dim), 0.1)
+        self.b = Node.randn((1, out_dim), 0.1, self.device)
         self.b.label = f"{label}.b" if label else "b"
 
     def forward(self, x):
-        return Node.matmul(x, self.W) + self.b
+        return Node.matmul(x, self.W, self.device) + self.b
+
+
+class Sigmoid(Module):
+    def __init__(self, device: Device = "cpu"):
+        super().__init__(device)
+
+    def forward(self, x):
+        return Node.sigmoid(x, self.device)
+
+
+class Softmax(Module):
+    def __init__(self, device: Device = "cpu"):
+        super().__init__(device)
+
+    def forward(self, x):
+        return Node.softmax(x, self.device)
