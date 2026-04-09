@@ -1,6 +1,6 @@
 import numpy as np
 from fygrad.node import Node
-from fygrad.optim import Adam
+from fygrad.optim import SGD
 import matplotlib.pyplot as plt
 
 np.random.seed(42)
@@ -11,7 +11,7 @@ y_hat = np.array([9, 8, 10, 12, 11, 13, 14])
 b1 = Node("b1", np.random.randn())
 b2 = Node("b2", np.random.randn())
 
-optim = Adam([b1, b2], lr=0.01, beta2=0.4)
+optim = SGD([b1, b2], lr=0.01)
 
 for i in range(1000):
     y = b1 + b2 * X
