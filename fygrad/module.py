@@ -19,6 +19,9 @@ class Module:
             params.extend(m.parameters())
         self._cached_params = params
         return self._cached_params
+    
+    def modules(self) -> List["Module"]:
+        return list(self._modules.values())
 
     def to_gpu(self):
         self._cached_params = None
